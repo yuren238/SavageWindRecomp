@@ -1,0 +1,61 @@
+# Builds the app on a pristine Windows runner and uploads the exe, so a build made
+# outside any particular machine can be compared with a local one.
+#
+# Same recipe as windows.yml (MSYS2 UCRT64: the toolchain docs/BUILD-windows.md sets up),
+# plus RELEASE=1 (the release configuration: no console, log to savagewind.log) and an
+# upload of the exe and its import library. No game code here, exactly like windows.yml.
+name: wear-build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [local/weapon-wear-053, local/plain-053]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            make mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-lld mingw-w64-ucrt-x86_64-sdl3
+            mingw-w64-ucrt-x86_64-ffmpeg mingw-w64-ucrt-x86_64-vulkan-headers mingw-w64-ucrt-x86_64-vulkan-loader
+            mingw-w64-ucrt-x86_64-shaderc
+            mingw-w64-ucrt-x86_64-spirv-tools mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-nasm
+      - name: Toolchain fingerprint
+        run: |
+          clang --version
+          pacman -Q mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-lld mingw-w64-ucrt-x86_64-crt \
+                     mingw-w64-ucrt-x86_64-sdl3 mingw-w64-ucrt-x86_64-ffmpeg || true
+          echo "--- runtime config the build picked:"
+          cat build/runtime_config 2>/dev/null || echo "(none yet)"
+      - name: Build
+        run: |
+          make -j$(nproc) RELEASE=1 B=build 2>&1 | tail -40
+          ls -l build/savagewind.exe build/savagewind.dll.a
+      - name: Fingerprint of the exe
+        run: |
+          echo "--- version string:"; strings -a build/savagewind.exe | grep -oE '0\.[0-9]+\.[0-9]+-alpha\.[0-9]+' | sort -u || true
+          echo "--- game lib id:";     strings -a build/savagewind.exe | grep -oE '[0-9a-f]{16}' | sort -u | head -5
+          echo "--- CRT TLS symbols:"; nm --defined-only build/savagewind.exe 2>/dev/null | grep -iE 'tls_callback|_tls_used|_tls_start' || true
+          echo "--- .tls size:";       objdump -h build/savagewind.exe | grep -E ' \.tls'
+          echo "--- game code inside (must be empty):"; nm build/savagewind.exe 2>/dev/null | grep ' f_70' | head -3 || true
+          echo "--- runtime config:";  cat build/runtime_config 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: savagewind-exe
+          path: |
+            build/savagewind.exe
+            build/savagewind.dll.a
+            build/runtime_config
+          if-no-files-found: error
