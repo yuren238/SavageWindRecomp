@@ -1906,27 +1906,36 @@ static void act_overlay_draw(ImGuiIO &io, float scale) {
 extern "C" void rec_drain(void);  // (runtime/nvn/vulkan/record.c)
 #endif
 
-// Remaining hits per weapon slot, over the pouch's weapon page. quick_drop.c samples the page in the game thread;
-// this only reads the snapshot. The pouch is authored at 1280x720 and scaled by `canvas`, so the grid is six
-// constants there: origin (123, 222), pitch 98, cell 81. The number sits 24 in from the left so a weapon's
-// attribute badge keeps its corner, and 5 down so it lines up with the badge's band.
+// Remaining hits per weapon slot, over the pouch's weapons page. quick_drop.c samples the page in the game thread;
+// this only reads the snapshot. The pouch is authored at 1280x720 and scaled by `canvas`, so its weapons grid is
+// these constants there: the first cell at (123, 222), 98 apart both ways, 5 across. The number sits WEAR_INSET_X in
+// from a cell's left edge (a weapon's attribute badge keeps its corner) and WEAR_INSET_Y down, on the badge's band.
+static const float WEAR_GRID_X = 123.f;     // (first cell, 1280x720)
+static const float WEAR_GRID_Y = 222.f;
+static const float WEAR_GRID_PITCH = 98.f;  // (cells are 98 apart, 81 wide)
+static const int WEAR_COLS = 5;
+static const float WEAR_INSET_X = 24.f;
+static const float WEAR_INSET_Y = 4.f;
+static const float WEAR_TEXT = 13.f;  // (at canvas 1: the badge's own label size)
+
 static void weapon_wear_draw(const ImGuiIO &io) {
-    uint32_t hits[20];
-    int n = quick_wear_page(hits, 20);
+    uint32_t hits[QUICK_WEAR_SLOTS];
+    int n = quick_wear_page(hits, QUICK_WEAR_SLOTS);
     ImFont *font = g_menu_font ? g_menu_font : g_font;
-    if (!n || !font) return;
     float canvas = fminf(io.DisplaySize.x / 1280.f, io.DisplaySize.y / 720.f);
+    if (!n || !font || canvas <= 0.f) return;
     float ox = (io.DisplaySize.x - 1280.f * canvas) * .5f, oy = (io.DisplaySize.y - 720.f * canvas) * .5f;
     ImDrawList *draw = ImGui::GetForegroundDrawList();
     for (int i = 0; i < n; i++) {
-        if (!hits[i]) continue;
+        if (!hits[i]) continue;  // (an empty slot, or an item with no life of its own)
         char text[8];
-        snprintf(text, sizeof text, "%u", hits[i]);
-        ImVec2 pos(ox + (123.f + (i % 5) * 98.f + 24.f) * canvas, oy + (222.f + (i / 5) * 98.f + 5.f) * canvas);
+        snprintf(text, sizeof text, "%u", hits[i]);  // at most three characters (quick_drop.c clamps)
+        ImVec2 pos(ox + (WEAR_GRID_X + (i % WEAR_COLS) * WEAR_GRID_PITCH + WEAR_INSET_X) * canvas,
+                   oy + (WEAR_GRID_Y + (i / WEAR_COLS) * WEAR_GRID_PITCH + WEAR_INSET_Y) * canvas);
         ImU32 color = hits[i] <= 1 ? IM_COL32(214, 76, 66, 255) :
                       hits[i] <= 3 ? IM_COL32(226, 164, 62, 255) : IM_COL32(234, 228, 208, 255);
-        draw->AddText(font, 15.f * canvas, ImVec2(pos.x + canvas, pos.y + canvas), IM_COL32(0, 0, 0, 160), text);
-        draw->AddText(font, 15.f * canvas, pos, color, text);
+        draw->AddText(font, WEAR_TEXT * canvas, ImVec2(pos.x + canvas, pos.y + canvas), IM_COL32(0, 0, 0, 160), text);
+        draw->AddText(font, WEAR_TEXT * canvas, pos, color, text);
     }
 }
 

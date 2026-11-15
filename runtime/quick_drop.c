@@ -1,4 +1,4 @@
-// Native quick-selector drop and cancel for BOTW 1.9.0.
+// Native quick-selector drop and cancel, and the pouch's remaining weapon hits, for BOTW 1.9.0.
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,6 +7,7 @@
 
 #include "game_sites.h"
 #include "hle.h"
+#include "quick_drop.h"
 #include "quick_drop_action.h"
 
 extern uint64_t input_buttons_now(void);
@@ -23,61 +24,90 @@ static uint64_t hint_now_ms(void) {
     return (uint64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
-// Remaining hits per weapon slot, drawn over the pouch's weapon page.
-// The page is paused while it is open, so one read-only walk of its 20 item
-// pointers per frame (Menu::execute) is enough: the render thread only ever
-// reads this snapshot. PouchItem+0x20 is that item's own life, in 1/100 hits,
-// so two of the same weapon keep their own numbers.
-#define WEAR_SLOTS 20
-#define WEAR_FRESH_MS 200
-static _Atomic uint64_t wear_stamp;  // 0: the weapon page is not showing
-static _Atomic int wear_n;
-static _Atomic uint32_t wear_hits[WEAR_SLOTS];
+// Remaining hits per weapon slot, drawn over the pouch's weapons page (runtime/ui/menu.mm).
+// The page is paused while it is open, so one read-only walk of its slots per Menu::execute
+// is enough: the render thread only ever reads the snapshot below, never guest memory.
+// PouchItem: +0x18 item type (0 = a weapon), +0x20 that item's own life in 1/100 hits,
+// +0x25 "this slot holds an item". Swords, claymores and spears share the page, so one
+// number per slot covers all three, and two of the same weapon keep their own numbers.
+#define WEAR_FRESH_MS 200  // a sample older than this is not drawn (the page is not showing)
+#define WEAR_HITS_MAX 999  // the number is drawn as at most three characters
 
-static int wear_on(void) {
-    static _Atomic int on = -1;
+static _Atomic uint32_t wear_seq;    // odd while a sample is being written
+static _Atomic uint64_t wear_stamp;  // 0: the weapons page is not showing
+static _Atomic int wear_n;
+static _Atomic uint32_t wear_hits[QUICK_WEAR_SLOTS];
+
+static bool wear_on(void) {
+    static _Atomic int on = -1;  // -1: not read yet
     int v = atomic_load(&on);
     if (v < 0) {
         const char *e = getenv("SAVAGEWIND_WEAR_UI");
-        v = !(e && e[0] == '0');
+        v = !(e && (!strcmp(e, "0") || !strcmp(e, "off")));
         atomic_store(&on, v);
     }
-    return v;
+    return v != 0;
 }
 
+static void wear_clear(void) { atomic_store(&wear_stamp, 0); }
+
+// One walk of the weapons page, in the game thread. Every early return clears the stamp,
+// so a page that is not showing is never left with an old snapshot of another one.
 static void wear_sample(Cpu *c) {
     uint64_t screen = c->x[0];
-    atomic_store(&wear_stamp, 0);
-    if (!wear_on() || !guest_range(screen, 0x38e5)) return;
-    if ((int32_t)LD32(screen + 0x3738) != 0) return;  // category 0: the weapon page
-    int count = (int32_t)LD32(screen + 0x3880);
-    if (count < 0 || count > WEAR_SLOTS) return;
-    for (int i = 0; i < WEAR_SLOTS; i++) {
-        uint32_t hits = 0;
-        uint64_t item = i < count ? LD64(screen + 0x37c8 + (uint64_t)i * 8) : 0;
-        if (item && guest_range(item, 0x38)) {
-            int32_t life = (int32_t)LD32(item + 0x20);
-            if (life > 0) hits = (uint32_t)((life + 99) / 100);
-            if (hits > 999) hits = 999;
-        }
-        atomic_store(&wear_hits[i], hits);
+    uint64_t mgr = 0;
+    int count = 0;
+    if (wear_on() && guest_range(screen, 0x38e5) &&
+        (int32_t)LD32(screen + 0x3738) == 0 &&  // category 0: the weapons tab
+        LD8(screen + 0x38e4) != 2) {            // (not the closing transition)
+        mgr = LD64(screen + 0x3640);
+        count = (int32_t)LD32(screen + 0x3880);
     }
-    atomic_store(&wear_n, count);
-    atomic_store(&wear_stamp, hint_now_ms());
+    if (count < 0 || count > QUICK_WEAR_SLOTS || !guest_range(mgr, 0x45000)) {
+        wear_clear();
+        return;
+    }
+    // The pouch's own lock, as update_drop_hint takes it: the slot pointers are the game's,
+    // and reading through them has to sit in the same section as the pointers' own use.
+    probe_call(c, g_site.pouch_lock, mgr + 0x28, 0, 0);
+    uint32_t hits[QUICK_WEAR_SLOTS];
+    for (int i = 0; i < QUICK_WEAR_SLOTS; i++) {
+        hits[i] = 0;
+        uint64_t item = i < count ? LD64(screen + 0x37c8 + (uint64_t)i * 8) : 0;
+        if (!guest_range(item, 0x38) || !LD8(item + 0x25)) continue;  // (an empty slot)
+        if ((int32_t)LD32(item + 0x18) != 0) continue;                // (not a weapon: no life)
+        int32_t life = (int32_t)LD32(item + 0x20);
+        if (life <= 0) continue;
+        uint32_t n = (uint32_t)((life + 99) / 100);  // 1/100 hits: one hit left still reads 1
+        hits[i] = n > WEAR_HITS_MAX ? WEAR_HITS_MAX : n;
+    }
+    probe_call(c, g_site.pouch_unlock, mgr + 0x28, 0, 0);
+    // Publish as a whole: the sequence runs odd while the slots and the count change.
+    atomic_fetch_add_explicit(&wear_seq, 1, memory_order_relaxed);
+    for (int i = 0; i < QUICK_WEAR_SLOTS; i++) atomic_store_explicit(&wear_hits[i], hits[i], memory_order_relaxed);
+    atomic_store_explicit(&wear_n, count, memory_order_relaxed);
+    atomic_fetch_add_explicit(&wear_seq, 1, memory_order_release);  // (the reader pairs with this)
+    atomic_store_explicit(&wear_stamp, hint_now_ms(), memory_order_release);
 }
 
 bool quick_wear_active(void) {
-    uint64_t stamp = atomic_load(&wear_stamp);
+    uint64_t stamp = atomic_load_explicit(&wear_stamp, memory_order_acquire);
     return stamp && hint_now_ms() - stamp <= WEAR_FRESH_MS;
 }
 
 int quick_wear_page(uint32_t *hits, int max) {
-    if (!quick_wear_active()) return 0;
-    int n = atomic_load(&wear_n);
-    if (n < 0) return 0;
-    if (n > max) n = max;
-    for (int i = 0; i < n; i++) hits[i] = atomic_load(&wear_hits[i]);
-    return n;
+    if (max <= 0 || !quick_wear_active()) return 0;
+    for (int tries = 0; tries < 4; tries++) {  // a sample in progress: read it whole, or not at all
+        uint32_t s1 = atomic_load_explicit(&wear_seq, memory_order_acquire);
+        if (s1 & 1) continue;
+        int n = atomic_load_explicit(&wear_n, memory_order_relaxed);
+        if (n < 0) n = 0;
+        if (n > QUICK_WEAR_SLOTS) n = QUICK_WEAR_SLOTS;
+        if (n > max) n = max;
+        for (int i = 0; i < n; i++) hits[i] = atomic_load_explicit(&wear_hits[i], memory_order_relaxed);
+        if (s1 == atomic_load_explicit(&wear_seq, memory_order_acquire)) return n;
+    }
+    return 0;
 }
 
 // 0 hidden, 1/2 drop unavailable/available, 3 back only.
