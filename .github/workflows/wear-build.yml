@@ -1,9 +1,9 @@
-# Builds the app on a pristine Windows runner and uploads the exe, so a build made
-# outside any particular machine can be compared with a local one.
+# Builds the app on a pristine Windows runner, optionally with an older clang or an older
+# mingw-w64 CRT taken from the MSYS2 archive, and uploads each exe.
 #
-# Same recipe as windows.yml (MSYS2 UCRT64: the toolchain docs/BUILD-windows.md sets up),
-# plus RELEASE=1 (the release configuration: no console, log to savagewind.log) and an
-# upload of the exe and its import library. No game code here, exactly like windows.yml.
+# Why: the release (v0.5.3-alpha.5, published 2026-11-12) runs, every build made with the
+# current MSYS2 UCRT64 (clang 23.1.5, crt r598) dies at the first guest call, on any machine.
+# These variants walk the toolchain back to the packages that were current at release time.
 name: wear-build
 
 on:
@@ -18,6 +18,10 @@ jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [base, clang-23.1.4, crt-r569, both]
     defaults:
       run:
         shell: msys2 {0}
@@ -32,30 +36,40 @@ jobs:
             mingw-w64-ucrt-x86_64-ffmpeg mingw-w64-ucrt-x86_64-vulkan-headers mingw-w64-ucrt-x86_64-vulkan-loader
             mingw-w64-ucrt-x86_64-shaderc
             mingw-w64-ucrt-x86_64-spirv-tools mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-nasm
+      - name: Toolchain back to the release date
+        if: matrix.variant != 'base'
+        run: |
+          A=https://repo.msys2.org/mingw/ucrt64
+          pkgs=""
+          case "${{ matrix.variant }}" in
+            *clang*) pkgs="$pkgs $A/mingw-w64-ucrt-x86_64-clang-23.1.4-2-any.pkg.tar.zst"
+                     pkgs="$pkgs $A/mingw-w64-ucrt-x86_64-clang-libs-23.1.4-2-any.pkg.tar.zst"
+                     pkgs="$pkgs $A/mingw-w64-ucrt-x86_64-llvm-libs-23.1.4-2-any.pkg.tar.zst"
+                     pkgs="$pkgs $A/mingw-w64-ucrt-x86_64-lld-23.1.4-2-any.pkg.tar.zst" ;;
+          esac
+          case "${{ matrix.variant }}" in
+            *crt*) pkgs="$pkgs $A/mingw-w64-ucrt-x86_64-crt-14.0.0.r569.g34eeafb7d-1-any.pkg.tar.zst" ;;
+          esac
+          pacman -U --noconfirm $pkgs || pacman -U --noconfirm --nodeps $pkgs
       - name: Toolchain fingerprint
         run: |
-          clang --version
-          pacman -Q mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-lld mingw-w64-ucrt-x86_64-crt \
-                     mingw-w64-ucrt-x86_64-sdl3 mingw-w64-ucrt-x86_64-ffmpeg || true
-          echo "--- runtime config the build picked:"
-          cat build/runtime_config 2>/dev/null || echo "(none yet)"
+          clang --version | head -2
+          pacman -Q mingw-w64-ucrt-x86_64-clang mingw-w64-ucrt-x86_64-clang-libs \
+                     mingw-w64-ucrt-x86_64-llvm-libs mingw-w64-ucrt-x86_64-lld \
+                     mingw-w64-ucrt-x86_64-crt mingw-w64-ucrt-x86_64-sdl3 mingw-w64-ucrt-x86_64-ffmpeg || true
       - name: Build
         run: |
-          make -j$(nproc) RELEASE=1 B=build 2>&1 | tail -40
+          make -j$(nproc) RELEASE=1 B=build 2>&1 | tail -30
           ls -l build/savagewind.exe build/savagewind.dll.a
       - name: Fingerprint of the exe
         run: |
           echo "--- version string:"; strings -a build/savagewind.exe | grep -oE '0\.[0-9]+\.[0-9]+-alpha\.[0-9]+' | sort -u || true
           echo "--- game lib id:";     strings -a build/savagewind.exe | grep -oE '[0-9a-f]{16}' | sort -u | head -5
-          echo "--- CRT TLS symbols:"; nm --defined-only build/savagewind.exe 2>/dev/null | grep -iE 'tls_callback|_tls_used|_tls_start' || true
+          echo "--- CRT TLS symbols:"; nm --defined-only build/savagewind.exe 2>/dev/null | grep -iE 'tls_callback|_tls_used' || true
           echo "--- .tls size:";       objdump -h build/savagewind.exe | grep -E ' \.tls'
           echo "--- game code inside (must be empty):"; nm build/savagewind.exe 2>/dev/null | grep ' f_70' | head -3 || true
-          echo "--- runtime config:";  cat build/runtime_config 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         with:
-          name: savagewind-exe
-          path: |
-            build/savagewind.exe
-            build/savagewind.dll.a
-            build/runtime_config
+          name: savagewind-${{ matrix.variant }}
+          path: build/savagewind.exe
           if-no-files-found: error
