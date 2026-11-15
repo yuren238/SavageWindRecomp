@@ -1,5 +1,6 @@
 // Native quick-selector drop and cancel for BOTW 1.9.0.
 #include <inttypes.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -20,6 +21,63 @@ static uint64_t hint_now_ms(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (uint64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+// Remaining hits per weapon slot, drawn over the pouch's weapon page.
+// The page is paused while it is open, so one read-only walk of its 20 item
+// pointers per frame (Menu::execute) is enough: the render thread only ever
+// reads this snapshot. PouchItem+0x20 is that item's own life, in 1/100 hits,
+// so two of the same weapon keep their own numbers.
+#define WEAR_SLOTS 20
+#define WEAR_FRESH_MS 200
+static _Atomic uint64_t wear_stamp;  // 0: the weapon page is not showing
+static _Atomic int wear_n;
+static _Atomic uint32_t wear_hits[WEAR_SLOTS];
+
+static int wear_on(void) {
+    static _Atomic int on = -1;
+    int v = atomic_load(&on);
+    if (v < 0) {
+        const char *e = getenv("SAVAGEWIND_WEAR_UI");
+        v = !(e && e[0] == '0');
+        atomic_store(&on, v);
+    }
+    return v;
+}
+
+static void wear_sample(Cpu *c) {
+    uint64_t screen = c->x[0];
+    atomic_store(&wear_stamp, 0);
+    if (!wear_on() || !guest_range(screen, 0x38e5)) return;
+    if ((int32_t)LD32(screen + 0x3738) != 0) return;  // category 0: the weapon page
+    int count = (int32_t)LD32(screen + 0x3880);
+    if (count < 0 || count > WEAR_SLOTS) return;
+    for (int i = 0; i < WEAR_SLOTS; i++) {
+        uint32_t hits = 0;
+        uint64_t item = i < count ? LD64(screen + 0x37c8 + (uint64_t)i * 8) : 0;
+        if (item && guest_range(item, 0x38)) {
+            int32_t life = (int32_t)LD32(item + 0x20);
+            if (life > 0) hits = (uint32_t)((life + 99) / 100);
+            if (hits > 999) hits = 999;
+        }
+        atomic_store(&wear_hits[i], hits);
+    }
+    atomic_store(&wear_n, count);
+    atomic_store(&wear_stamp, hint_now_ms());
+}
+
+bool quick_wear_active(void) {
+    uint64_t stamp = atomic_load(&wear_stamp);
+    return stamp && hint_now_ms() - stamp <= WEAR_FRESH_MS;
+}
+
+int quick_wear_page(uint32_t *hits, int max) {
+    if (!quick_wear_active()) return 0;
+    int n = atomic_load(&wear_n);
+    if (n < 0) return 0;
+    if (n > max) n = max;
+    for (int i = 0; i < n; i++) hits[i] = atomic_load(&wear_hits[i]);
+    return n;
 }
 
 // 0 hidden, 1/2 drop unavailable/available, 3 back only.
@@ -66,6 +124,7 @@ static void update_drop_hint(Cpu *c) {
 RT_ON_RESET(quick_drop_reset) {
     menu_screen = menu_buttons = 0;
     atomic_store(&drop_hint, 0);
+    atomic_store(&wear_stamp, 0);
 }
 
 static bool quick_drop_enabled(void) {
@@ -183,6 +242,7 @@ static void quick_drop_menu(Cpu *c) {
 
 
 void rt_quick_drop_menu(Cpu *c) {
+    wear_sample(c);  // independent of the drop setting
     if (!quick_drop_enabled()) {
         menu_screen = menu_buttons = 0;
         atomic_store(&drop_hint, 0);

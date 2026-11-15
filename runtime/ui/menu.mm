@@ -1906,6 +1906,30 @@ static void act_overlay_draw(ImGuiIO &io, float scale) {
 extern "C" void rec_drain(void);  // (runtime/nvn/vulkan/record.c)
 #endif
 
+// Remaining hits per weapon slot, over the pouch's weapon page. quick_drop.c samples the page in the game thread;
+// this only reads the snapshot. The pouch is authored at 1280x720 and scaled by `canvas`, so the grid is six
+// constants there: origin (123, 222), pitch 98, cell 81. The number sits 24 in from the left so a weapon's
+// attribute badge keeps its corner, and 5 down so it lines up with the badge's band.
+static void weapon_wear_draw(const ImGuiIO &io) {
+    uint32_t hits[20];
+    int n = quick_wear_page(hits, 20);
+    ImFont *font = g_menu_font ? g_menu_font : g_font;
+    if (!n || !font) return;
+    float canvas = fminf(io.DisplaySize.x / 1280.f, io.DisplaySize.y / 720.f);
+    float ox = (io.DisplaySize.x - 1280.f * canvas) * .5f, oy = (io.DisplaySize.y - 720.f * canvas) * .5f;
+    ImDrawList *draw = ImGui::GetForegroundDrawList();
+    for (int i = 0; i < n; i++) {
+        if (!hits[i]) continue;
+        char text[8];
+        snprintf(text, sizeof text, "%u", hits[i]);
+        ImVec2 pos(ox + (123.f + (i % 5) * 98.f + 24.f) * canvas, oy + (222.f + (i / 5) * 98.f + 5.f) * canvas);
+        ImU32 color = hits[i] <= 1 ? IM_COL32(214, 76, 66, 255) :
+                      hits[i] <= 3 ? IM_COL32(226, 164, 62, 255) : IM_COL32(234, 228, 208, 255);
+        draw->AddText(font, 15.f * canvas, ImVec2(pos.x + canvas, pos.y + canvas), IM_COL32(0, 0, 0, 160), text);
+        draw->AddText(font, 15.f * canvas, pos, color, text);
+    }
+}
+
 // Native-style selector prompt. Draw-only: input still belongs to the game.
 static void quick_inventory_hint_draw(const ImGuiIO &io) {
     int kind = g_settings.button_icons;
@@ -1982,7 +2006,8 @@ static bool menu_draws(bool *pointer_hover = NULL, float *pointer_box = NULL, bo
     if (pointer_hover) *pointer_hover = hover;
     if (gyro_show) *gyro_show = gyro_on;
     return g_open.load() || g_kbd.load() == 1 || g_sizes.load() || console_is_open() || gyro_on || hover ||
-           g_settings.perf_overlay != PERF_OFF || act_log_enabled() || quick_inventory_sort_hint() || quick_drop_hint_state();
+           g_settings.perf_overlay != PERF_OFF || act_log_enabled() || quick_inventory_sort_hint() || quick_drop_hint_state() ||
+           quick_wear_active();
 }
 
 bool menu_render_needed(void) { return menu_draws(); }
@@ -2067,6 +2092,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     if (g_settings.perf_overlay != PERF_OFF) perf_overlay_draw(io, scale);
     if (act_log_enabled()) act_overlay_draw(io, scale);
     if (!open && !kbd && !sizes && !con && (quick_inventory_sort_hint() || quick_drop_hint_state())) quick_inventory_hint_draw(io);
+    if (!open && !kbd && !sizes && !con) weapon_wear_draw(io);
     if (!open && !kbd && !sizes && !con) photo_overlay_draw(io, scale);
     if (!open && !kbd && !sizes && !con && gyro_scene_show) gyro_scene_draw(io, scale, gyro_scene);
 
